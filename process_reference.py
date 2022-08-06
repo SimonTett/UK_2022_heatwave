@@ -6,60 +6,76 @@ import dask
 
 use_cache= True # set false if want to regenerate cached data. Otherwise will just read in data.
 
-def proc_eucleia(root_direct,var,output_file_root,rolling=None,xc='lon',yc='lat',test=False):
+def proc_eucleia(root_direct,var,output_file_root,
+                 rolling=None,xc='lon',yc='lat',test=False):
 
     output_file=codeLib.output_dir/f'{output_file_root}_{var}_roll{rolling}.nc'
+    ts_output_file=codeLib.output_dir/f'{output_file_root}_{var}_roll{rolling}_ts.nc'
     if use_cache &  output_file.exists(): # using cache and output file exists. So read it and return
-        ts = xarray.load_dataset(output_file)
-        return ts
+        mx_result = xarray.load_dataset(output_file)
+        ts_result = xarray.load_dataset(ts_output_file)
+        return mx_result,ts_result
+
 
     # now to process
         
 
     ts_lst=[]
+    mx_lst=[]
     dirs = list(root_direct.glob('r*'))
     if test:
         dirs= [dirs[0]]  # for testing
 
     for indx,ensemble in enumerate(dirs):
+        outputFile = codeLib.output_dir/f'{output_file_root}_{var}{rolling}_{ensemble.name}.nc' # 
+        print(f"cache file is {outputFile}")
         direct=ensemble/'latest'
         print(direct," ",var)
         files=list(direct.glob(f'{var}_*.nc'))
-        ts=proc_files(files, var,rolling=rolling,xc=xc,yc=yc)
+        mx,ts=proc_files(files, var,rolling=rolling,xc=xc,yc=yc,outputFile=outputFile)
         print("="*60)
-        ts = ts.assign_coords(realization=indx)
-        ts_lst.append(ts)
+        for t,lst in zip([ts,mx],[ts_lst,mx_lst]):
+            t = t.assign_coords(realization=indx)
+            lst.append(t)
 
-    ts=xarray.concat(ts_lst,dim='realization',combine_attrs='override')
+
+    result_ts=xarray.concat(ts_lst,dim='realization',combine_attrs='override')
+    result_mx=xarray.concat(mx_lst,dim='realization',combine_attrs='override')
     if not test: # no caching when testing.
-        ts.to_netcdf(output_file) # write data out
-    return ts
+        result_mx.to_netcdf(output_file) # write data out
+        result_ts.to_netcdf(ts_output_file) # write data out
+    return result_mx,result_ts
 
-def proc_extension(root_direct,var,output_file_root,rolling=None,xc='longitude',yc='latitude',test=False):
+def proc_extension(root_direct,var,output_file_root,
+                   rolling=None,xc='longitude',yc='latitude',test=False):
 
     output_file=codeLib.output_dir/f'{output_file_root}_{var}_roll{rolling}.nc'
+    ts_output_file=codeLib.output_dir/f'{output_file_root}_{var}_roll{rolling}_ts.nc'
     if use_cache &  output_file.exists(): # using cache and output file exists. So read it and return
-        ts = xarray.load_dataset(output_file)
-        return ts
+        mx_result = xarray.load_dataset(output_file)
+        ts_result = xarray.load_dataset(ts_output_file)
+        return mx_result,ts_result
 
     # now to process
         
 
+    mx_lst=[]
     ts_lst=[]
     for realization in range(0,105):
         for physics in range(0,5):
             pattern = f'{var}_day_HadGEM3-A-N216_*_r{realization+1:03d}i1p{physics+1:1d}_*.nc'
-            output_file = codeLib.output_dir/f'{output_file_root}_{var}{rolling}_r{realization+1:03d}i1p{physics+1:1d}.nc' # 
+            outputFile = codeLib.output_dir/f'{output_file_root}_{var}{rolling}_r{realization+1:03d}i1p{physics+1:1d}.nc' # 
             files = list((root_direct/var/'day').glob(pattern))
             if len(files) == 0:
                 print("No files found for ",pattern)
                 continue 
             print(pattern,len(files))
             try:
-                ts=proc_files(files, var,rolling=rolling,xc=xc,yc=yc,outputFile=output_file)
+                mx,ts=proc_files(files, var,rolling=rolling,xc=xc,yc=yc,outputFile=outputFile)
                 print("="*60)
-                ts = ts.assign_coords(realization=(realization+physics*105))
-                ts_lst.append(ts)
+                for t,lst in zip([ts,mx],[ts_lst,mx_lst]):
+                    t = t.assign_coords(realization=(realization+physics*105))
+                    lst.append(t)
             except OSError:
                 print("Some problem in ",files)
             if test:
@@ -67,19 +83,35 @@ def proc_extension(root_direct,var,output_file_root,rolling=None,xc='longitude',
         if test:
             break
 
-    ts=xarray.concat(ts_lst,dim='realization',combine_attrs='override')
+    result_mx=xarray.concat(mx_lst,dim='realization',combine_attrs='override')
+    result_ts=xarray.concat(ts_lst,dim='realization',combine_attrs='override')
     if not test: # no caching when testing.
-        ts.to_netcdf(output_file) # write data out
-    return ts
+        result_mx.to_netcdf(output_file) # write data out
+        result_ts.to_netcdf(ts_output_file) # write data out
+    return result_mx,result_ts
 
 def proc_files(files, var,rolling=None,xc='lon',yc='lat',outputFile=None):
+    
+    if outputFile is not None:
+        ts_outputFile = outputFile.parent/(outputFile.stem+"_ts.nc")
+    else:
+        ts_outputFile = None
 
     if use_cache and  (outputFile is not None) and outputFile.exists(): # using cache
-        ts_mx= xarray.load_dataset(outputfile)
-        return ts_mx
+        ts_mx= xarray.load_dataset(outputFile)
+        if ts_outputFile.exists(): # have ts as well so get it.
+            ts=xarray.load_dataset(ts_outputFile)
+            return ts_mx,ts 
     
     chunks={'time':3600,xc:100,yc:100}
-    ds = xarray.open_mfdataset(files,combine='nested',chunks=chunks).sortby('time')
+    with dask.config.set(**{'array.slicing.split_large_chunks': True}):
+        try:
+            ds = xarray.open_mfdataset(files,chunks=chunks)#.sortby('time')
+        except ValueError: #some problem so use combine by_coords which is slow
+            print("Combining nesting")
+            ds = xarray.open_mfdataset(files,chunks=chunks,combine='nested')
+        ds=ds.sortby('time') # sort by time.
+
     months = [6,7] # JJ only.
     timeSel=ds.time.dt.month.isin(months) 
     if rolling is not None:
@@ -90,7 +122,7 @@ def proc_files(files, var,rolling=None,xc='lon',yc='lat',outputFile=None):
         if rolling > 30: # rolling too large will need more months just compain
             raise NotImplementedError("rolling > 30")
                  
-    with dask.config.set(**{'array.slicing.split_large_chunks':True}):
+    with dask.config.set(**{'array.slicing.split_large_chunks':False}):
         da=ds[var].sel(time=timeSel).sel({yc:codeLib.region['lat']})
     L= (da[xc] >= (360+codeLib.region['lon'].start) ) | (da[xc] < codeLib.region['lon'].stop)
     da = da.where(L,drop=True)
@@ -107,40 +139,47 @@ def proc_files(files, var,rolling=None,xc='lon',yc='lat',outputFile=None):
     timeSel=(ts_mx.time.dt.season == 'JJA') # summer only.
     ts_mx=ts_mx.sel(time=timeSel)
     ts_mx.attrs=ds.attrs
-    if outputFile is not None: # write file to cache
+    if outputFile is not None: # write files to cache
         ts_mx.to_netcdf(outputFile)
-    return ts_mx
+        ts.to_netcdf(ts_outputFile)
+        
+    return ts_mx,ts
 
 # process the data
 
 
-results_ref=dict()
-results_hist105=dict()
-results_nat105=dict()
-results_hist525=dict()
-results_nat525=dict()
 rolling_var=dict(tas=2)
-for var in ['tas','tasmax']:
-    rolling=rolling_var.get(var)
-    ts=proc_eucleia(codeLib.reference_dir,var,'reference_ens',rolling=rolling,test=False)
-    results_ref[var]=ts
-    # process the  105 member ensemble.
-    ts=proc_eucleia(codeLib.hist105_dir,var,'hist105_ens',rolling=rolling,test=False)
-    results_hist105[var]=ts
-    ts=proc_eucleia(codeLib.nat105_dir,var,'nat105_ens',rolling=rolling,test=False)
-    results_nat105[var]=ts
-    # process the 525 member ensembles
-    ts=proc_extension(codeLib.hist525_dir,var,'hist525_ens',rolling=rolling,test=False)
-    results_hist525[var]=ts
-    ts=proc_extension(codeLib.nat525_dir,var,'nat525_ens',rolling=rolling,test=False)
-    results_nat525[var]=ts
 
-ref_mx=xarray.merge(results_ref.values())
-hist105=xarray.merge(results_hist105.values())
-nat105=xarray.merge(results_nat105.values())
-hist525=xarray.merge(results_hist525.values())
-nat525=xarray.merge(results_nat525.values())
+test=False # If True run in test mode -- only one realization gets processed per case
+results_ts=dict()
+results_mx=dict()
+for dir,name in zip(
+        [codeLib.reference_dir,codeLib.hist105_dir,codeLib.nat105_dir,codeLib.hist525_dir,codeLib.nat525_dir],
+        ['reference_ens','hist105_ens','nat105_ens','hist525_ens','nat525_ens']):
+    
+    lst_mx=[]
+    lst_ts=[]
+    for var in ['tas','tasmax']:
+        rolling=rolling_var.get(var)
+        print("Processing ",name," ",var,"rolling",rolling, end=' ')
+        if dir.name.endswith('Ext'):
+            print("Using proc_extension")
+            mx,ts=proc_extension(dir,var,name,rolling=rolling,test=test)
+        else:
+            print("Using proc_eucleia")
+            mx,ts=proc_eucleia(dir,var,name,rolling=rolling,test=test)
+        lst_mx.append(mx)
+        lst_ts.append(ts)
+    # end processing var. Now merge into one dataSet the ts and mx info
+    results_ts[name]=xarray.merge(lst_ts)
+    results_mx[name]=xarray.merge(lst_mx)
 
+# now write everthing out!
+for key,ds in results_ts.items():
+    file=codeLib.output_dir/("HadGEM-GA6-N216_"+key+'_all_ts.nc')
+    ds.to_netcdf(file)
 
-
+for key,ds in results_mx.items():
+    file=codeLib.output_dir/("HadGEM-GA6-N216_"+key+'_all_mx.nc')
+    ds.to_netcdf(file)
 
